@@ -64,15 +64,6 @@ func setupNetwork() error {
 	return nil
 }
 
-// cleanupNetwork cleans up the network configuration
-func cleanupNetwork() {
-	log.Println("--- Cleaning Up Network ---")
-	// Remove routing rules; ignore errors as interfaces may no longer exist
-	runCommand("ip", "route", "del", IFACE2_NET)
-	runCommand("ip", "route", "del", IFACE1_NET)
-	log.Println("--- Cleanup Complete ---")
-}
-
 // forward copies data from one interface to another
 func forward(src, dst *water.Interface) {
 	packet := make([]byte, 65536) // MTU buffer
@@ -90,7 +81,46 @@ func forward(src, dst *water.Interface) {
 	}
 }
 
-func Run() {
+type packet struct {
+	data []byte
+}
+
+func readFromTun(iface *water.Interface, ch chan<- packet) {
+	defer close(ch)
+
+	buffer := make([]byte, 65536)
+	for {
+		n, err := iface.Read(buffer)
+		if err != nil {
+			log.Printf("Error reading from %s: %v. Goroutine terminating.", iface.Name(), err)
+			return
+		}
+
+		pktData := make([]byte, n)
+		copy(pktData, buffer[:n])
+
+		ch <- packet{data: pktData}
+	}
+}
+
+func writeToTun(ch <-chan packet, iface *water.Interface) {
+	for pkt := range ch {
+		_, err := iface.Write(pkt.data)
+		if err != nil {
+			log.Printf("Error writing to %s: %v. Goroutine terminating.", iface.Name(), err)
+			return
+		}
+	}
+	log.Printf("Channel for %s closed. Writer goroutine finished.", iface.Name())
+}
+func forwardWithChannel(src, dst *water.Interface) {
+	channel := make(chan packet, 2048)
+	go readFromTun(src, channel)
+	go writeToTun(channel, dst)
+}
+
+func Run(useChannel bool) {
+	log.Printf("useChannel %t ", useChannel)
 	if os.Geteuid() != 0 {
 		log.Fatal("This program must be run as root/sudo to configure network interfaces.")
 	}
@@ -121,12 +151,17 @@ func Run() {
 	if err := setupNetwork(); err != nil {
 		log.Fatalf("Failed to setup network: %v", err)
 	}
-	// Use defer to ensure cleanup is performed on program exit
-	defer cleanupNetwork()
 
 	// --- Start bidirectional forwarding ---
-	go forward(tun1, tun2)
-	go forward(tun2, tun1)
+	if useChannel {
+		log.Println("Starting forwarding with channel...")
+		forwardWithChannel(tun1, tun2)
+		forwardWithChannel(tun2, tun1)
+	} else {
+		log.Println("Starting direct forwarding (no channel)...")
+		go forward(tun1, tun2)
+		go forward(tun2, tun1)
+	}
 
 	// --- Wait for termination signal ---
 	sig := make(chan os.Signal, 1)
