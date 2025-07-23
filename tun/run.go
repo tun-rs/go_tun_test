@@ -94,13 +94,13 @@ func readToChannel(src Device, ch chan<- packet) {
 	readBufs := make([][]byte, batchSize)
 	sizes := make([]int, batchSize)
 	for i := 0; i < batchSize; i++ {
-		readBufs[i] = make([]byte, mtuSize+offset)
+		readBufs[i] = make([]byte, mtuSize)
 	}
 
 	usePool := packetBufferPool != nil // Check if the global pool is initialized
 
 	for {
-		n, err := src.Read(readBufs, sizes, offset)
+		n, err := src.Read(readBufs, sizes, 0)
 		if err != nil {
 			log.Printf("Read error, exiting goroutine: %v", err)
 			return
@@ -111,18 +111,10 @@ func readToChannel(src Device, ch chan<- packet) {
 			if usePool {
 				pktBuf = packetBufferPool.Get().([]byte)
 			} else {
-				pktBuf = make([]byte, maxPktSize)
+				pktBuf = make([]byte, sizes[i])
 			}
 
-			size := sizes[i] + offset
-
-			// Defensive check, though should be rare if maxPktSize is correct.
-			if cap(pktBuf) < size {
-				log.Printf("Warning: Buffer obtained is too small. Allocating new.")
-				pktBuf = make([]byte, size) // Fallback
-				// Note: if this fallback happens and usePool is true, this specific buffer won't be returned to the pool.
-			}
-
+			size := sizes[i]
 			copy(pktBuf, readBufs[i][:size])
 			ch <- packet{buf: pktBuf, size: size}
 		}
@@ -132,15 +124,22 @@ func readToChannel(src Device, ch chan<- packet) {
 // writeFromChannel receives packets from a channel and writes them to a destination device.
 // It conditionally returns buffers to the sync.Pool.
 func writeFromChannel(dst Device, ch <-chan packet) {
-	bufs := make([][]byte, batchSize)
-	originalBufs := make([][]byte, batchSize) // To store original pooled buffers
+	var zeroBuf = make([]byte, offset) // 全零
+
+	sendBufs := make([][]byte, batchSize)
+	for i := range sendBufs {
+		sendBufs[i] = make([]byte, maxPktSize)
+	}
 
 	usePool := packetBufferPool != nil // Check if the global pool is initialized
 	for pkt := range ch {
-		var n int
-		bufs[0] = pkt.buf[:pkt.size]
+		n := 0
+		buf := sendBufs[n][:offset+pkt.size]
+		copy(buf[:offset], zeroBuf)
+		copy(buf[offset:], pkt.buf[:pkt.size])
+		sendBufs[n] = buf
 		if usePool {
-			originalBufs[0] = pkt.buf // Store the original buffer for returning to pool
+			packetBufferPool.Put(pkt.buf)
 		}
 
 		// Collect more packets if they are immediately available.
@@ -148,9 +147,12 @@ func writeFromChannel(dst Device, ch <-chan packet) {
 		for n = 1; n < batchSize; n++ {
 			select {
 			case pkt := <-ch:
-				bufs[n] = pkt.buf[:pkt.size]
+				buf := sendBufs[n][:offset+pkt.size]
+				copy(buf[:offset], zeroBuf)
+				copy(buf[offset:], pkt.buf[:pkt.size])
+				sendBufs[n] = buf
 				if usePool {
-					originalBufs[n] = pkt.buf
+					packetBufferPool.Put(pkt.buf)
 				}
 			default:
 				break collect
@@ -158,17 +160,9 @@ func writeFromChannel(dst Device, ch <-chan packet) {
 		}
 
 		if n > 0 {
-			_, err := dst.Write(bufs[:n], offset)
+			_, err := dst.Write(sendBufs[:n], offset)
 			if err != nil {
 				log.Printf("Write error: %v", err)
-			}
-
-			// IMPORTANT: Conditionally return all used buffers to the pool.
-			if usePool {
-				for i := 0; i < n; i++ {
-					// Return the original full buffer, not the sliced one.
-					packetBufferPool.Put(originalBufs[i])
-				}
 			}
 		}
 	}
@@ -186,7 +180,7 @@ func forwardWithChannel(src, dst Device, usePool bool) {
 		// a simple nil check is sufficient.
 		packetBufferPool = &sync.Pool{
 			New: func() interface{} {
-				return make([]byte, maxPktSize)
+				return make([]byte, mtuSize)
 			},
 		}
 		log.Println("Initialized sync.Pool for packet buffers.")
@@ -246,4 +240,3 @@ func Run(useChannel bool, usePool bool) { // Added usePool parameter
 
 	log.Println("Shutdown complete.")
 }
-
